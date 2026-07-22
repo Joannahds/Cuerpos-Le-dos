@@ -1,0 +1,211 @@
+// ASIGNACIÓN DE PINES
+const int PIN_VALVULA_ENTRADA = 8;
+const int PIN_VALVULA_SALIDA  = 9;
+
+// Sensor ultrasónico HC-SR04 (ocupa los pines que antes usaba el SoftwareSerial del radar)
+const int PIN_TRIG = 2;
+const int PIN_ECHO = 3;
+const int DISTANCIA_MAXIMA_CM = 600; // Mismo rango máximo que se usaba antes (0-600 cm)
+
+// =====================================================================
+// MÁQUINA DE ESTADOS DE VÁLVULAS (100% por tiempo, no bloqueante)
+// =====================================================================
+enum EstadoValvulas {
+  ST_INFLADO_INICIAL,  // Entrada ON 8 min (una sola vez al conectar)
+  ST_ESPERA_INICIAL,   // Ambas cerradas 2 min (una sola vez)
+  ST_CICLO_ENTRADA,    // Entrada ON (1 min si es el ciclo 1, 2 min en los ciclos 2-5)
+  ST_CICLO_SALIDA,     // Entrada cerrada, Salida ON 3 min
+  ST_PAUSA_10MIN       // Ambas cerradas 10 min, luego reinicia el bloque de 5 ciclos
+};
+
+EstadoValvulas estadoValvulas = ST_INFLADO_INICIAL;
+unsigned long tiempoEstadoInicio = 0;
+int cicloActual = 1; // 1 a 5
+
+// Duraciones en milisegundos
+const unsigned long DUR_INFLADO_INICIAL   = 480000UL; // 8 min
+const unsigned long DUR_ESPERA_INICIAL    = 120000UL; // 2 min
+const unsigned long DUR_ENTRADA_CICLO1    = 60000UL;  // 1 min (solo ciclo 1)
+const unsigned long DUR_ENTRADA_CICLO2_5  = 120000UL; // 2 min (ciclos 2 a 5)
+const unsigned long DUR_SALIDA_CICLO      = 180000UL; // 3 min
+const unsigned long DUR_PAUSA_10MIN       = 600000UL; // 10 min
+const int TOTAL_CICLOS = 5;
+
+void manejarValvulas(unsigned long ahora) {
+  unsigned long transcurrido = ahora - tiempoEstadoInicio;
+
+  switch (estadoValvulas) {
+
+    case ST_INFLADO_INICIAL:
+      if (transcurrido >= DUR_INFLADO_INICIAL) {
+        digitalWrite(PIN_VALVULA_ENTRADA, LOW);
+        estadoValvulas = ST_ESPERA_INICIAL;
+        tiempoEstadoInicio = ahora;
+        Serial.println("VALVULAS: fin inflado inicial (8 min). Esperando 2 min.");
+      }
+      break;
+
+    case ST_ESPERA_INICIAL:
+      if (transcurrido >= DUR_ESPERA_INICIAL) {
+        cicloActual = 1;
+        digitalWrite(PIN_VALVULA_ENTRADA, HIGH);
+        estadoValvulas = ST_CICLO_ENTRADA;
+        tiempoEstadoInicio = ahora;
+        Serial.println("VALVULAS: inicia bloque de 5 ciclos - ciclo 1 (entrada 1 min).");
+      }
+      break;
+
+    case ST_CICLO_ENTRADA: {
+      unsigned long duracionEntrada = (cicloActual == 1) ? DUR_ENTRADA_CICLO1 : DUR_ENTRADA_CICLO2_5;
+      if (transcurrido >= duracionEntrada) {
+        digitalWrite(PIN_VALVULA_ENTRADA, LOW);
+        digitalWrite(PIN_VALVULA_SALIDA, HIGH);
+        estadoValvulas = ST_CICLO_SALIDA;
+        tiempoEstadoInicio = ahora;
+        Serial.print("VALVULAS: ciclo ");
+        Serial.print(cicloActual);
+        Serial.println(" - entrada cerrada, salida ON (3 min).");
+      }
+      break;
+    }
+
+    case ST_CICLO_SALIDA:
+      if (transcurrido >= DUR_SALIDA_CICLO) {
+        digitalWrite(PIN_VALVULA_SALIDA, LOW);
+
+        if (cicloActual >= TOTAL_CICLOS) {
+          estadoValvulas = ST_PAUSA_10MIN;
+          tiempoEstadoInicio = ahora;
+          Serial.println("VALVULAS: 5 ciclos completos. Pausa de 10 min (ambas cerradas).");
+        } else {
+          cicloActual++;
+          digitalWrite(PIN_VALVULA_ENTRADA, HIGH);
+          estadoValvulas = ST_CICLO_ENTRADA;
+          tiempoEstadoInicio = ahora;
+          Serial.print("VALVULAS: inicia ciclo ");
+          Serial.print(cicloActual);
+          Serial.println(" (entrada 2 min).");
+        }
+      }
+      break;
+
+    case ST_PAUSA_10MIN:
+      if (transcurrido >= DUR_PAUSA_10MIN) {
+        cicloActual = 1;
+        digitalWrite(PIN_VALVULA_ENTRADA, HIGH);
+        estadoValvulas = ST_CICLO_ENTRADA;
+        tiempoEstadoInicio = ahora;
+        Serial.println("VALVULAS: reinicia bloque de 5 ciclos - ciclo 1 (entrada 1 min).");
+      }
+      break;
+  }
+}
+
+// =====================================================================
+// MEDICIÓN DE DISTANCIA CON SENSOR ULTRASÓNICO (HC-SR04)
+// =====================================================================
+long medirDistanciaCM() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  // Timeout calculado en función de la distancia máxima deseada (con margen extra)
+  unsigned long timeoutMicros = (DISTANCIA_MAXIMA_CM * 2UL * 29UL) + 1000UL;
+  unsigned long duracion = pulseIn(PIN_ECHO, HIGH, timeoutMicros);
+
+  if (duracion == 0) {
+    return -1; // No hubo eco: fuera de rango o error de lectura
+  }
+
+  long distanciaCM = duracion / 2 / 29; // Velocidad del sonido ~343 m/s
+  return distanciaCM;
+}
+
+// =====================================================================
+// CONTROL DE VIDEO (TouchDesigner) SEGÚN DISTANCIA
+// =====================================================================
+bool esperandoAusencia = false;
+unsigned long tiempoInicioAusencia = 0;
+int videoActual = -1;
+
+void enviarVideo(int numeroVideo) {
+  if (videoActual != numeroVideo) {
+    videoActual = numeroVideo;
+    Serial.println(videoActual); // Envía solo el número limpio a TouchDesigner
+  }
+}
+
+void manejarVideo(bool detectando, int distanciaActual, unsigned long ahora) {
+  // Rango 40-80 cm -> Video 2 (envía 1)
+  if (detectando && distanciaActual >= 40 && distanciaActual <= 80) {
+    esperandoAusencia = false;
+    enviarVideo(1);
+  }
+  // Rango 81-164 cm -> Video 3 (envía 2)
+  else if (detectando && distanciaActual >= 81 && distanciaActual <= 164) {
+    esperandoAusencia = false;
+    enviarVideo(2);
+  }
+  // Ausencia: 0-39 cm, 165 cm en adelante, o sin detección
+  else {
+    if (!esperandoAusencia) {
+      tiempoInicioAusencia = ahora;
+      esperandoAusencia = true;
+    } else if (ahora - tiempoInicioAusencia > 2000) { // 2 seg de confirmación anti-ruido
+      enviarVideo(0);
+      esperandoAusencia = false;
+    }
+  }
+}
+
+// =====================================================================
+// SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {
+    delay(10);
+  }
+
+  pinMode(PIN_VALVULA_ENTRADA, OUTPUT);
+  pinMode(PIN_VALVULA_SALIDA, OUTPUT);
+  digitalWrite(PIN_VALVULA_ENTRADA, LOW);
+  digitalWrite(PIN_VALVULA_SALIDA, LOW);
+
+  // Configurar pines del sensor ultrasónico
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+
+  // Arranca la máquina de estados de válvulas: Entrada ON por 8 min (una sola vez)
+  digitalWrite(PIN_VALVULA_ENTRADA, HIGH);
+  estadoValvulas = ST_INFLADO_INICIAL;
+  tiempoEstadoInicio = millis();
+  Serial.println("VALVULAS: inicia inflado inicial (8 min).");
+
+  enviarVideo(0); // Arranca asumiendo ausencia
+}
+
+// =====================================================================
+// LOOP
+// =====================================================================
+void loop() {
+  int distanciaActual = medirDistanciaCM();
+  bool detectando = (distanciaActual > 0 && distanciaActual <= DISTANCIA_MAXIMA_CM);
+  unsigned long ahora = millis();
+
+  // Imprime la distancia SIEMPRE (todo el tiempo), haya o no detección
+  Serial.print("D: ");
+  if (detectando) {
+    Serial.println(distanciaActual);
+  } else {
+    Serial.println("sin deteccion");
+  }
+
+  manejarValvulas(ahora);
+  manejarVideo(detectando, distanciaActual, ahora);
+
+  delay(50);
+}
