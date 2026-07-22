@@ -1,0 +1,32 @@
+me - this DAT
+#
+# dat - the DAT that received the data
+# rowIndex - the row number the data was placed into
+# message - an ascii representation of the data
+#           Unprintable characters and unicode characters will
+#           not be preserved. Use the 'byteData' parameter to get
+#           the raw bytes that were sent.
+# byteData - byte array of the data
+# me - este operador (el Serial Callback DAT)
+# dat - el operador Serial DAT que recibió los datos
+
+def onReceive(dat, rowIndex, message, bytes):
+    try:
+        # Limpiamos el mensaje (quita espacios y saltos de línea \r o \n)
+        dato_limpio = message.strip()
+        
+        if dato_limpio:
+            nivel = int(dato_limpio)
+            
+            # Buscamos el Switch de video
+            op_switch = op('switch1') 
+            
+            # Si el switch existe y el número está en el rango correcto (0, 1 o 2)
+            if op_switch and 0 <= nivel <= 2:
+                op_switch.par.index = nivel  # Asigna directamente 0, 1 o 2 al Switch
+                    
+    except ValueError:
+        # Ignora cualquier interferencia o dato corrupto del puerto serial
+        pass
+        
+    return
